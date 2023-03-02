@@ -1,38 +1,21 @@
-#!/usr/bin/env python3
-"""
- Copyright (c) 2019-2023 Intel Corporation
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
-
-import logging as log
 import sys
-
+import boto3
 import numpy as np
 from openvino.runtime import Core, get_version
 from PIL import Image
-
-log.basicConfig(format='[ %(levelname)s ] %(message)s', level=log.DEBUG, stream=sys.stdout)
+import json
+import io
 
 SOS_INDEX = 0
 EOS_INDEX = 1
-MAX_SEQ_LEN = 28
+MAX_SEQ_LEN = 5
 
 
 def softmax(x, axis=None):
     x = x - x.max(axis=axis, keepdims=True)
     y = np.exp(x)
     return y / y.sum(axis=axis, keepdims=True)
+
 
 def expand_box(box, scale):
     w_half = (box[2] - box[0]) * .5
@@ -68,62 +51,82 @@ def segm_postprocess(box, raw_cls_mask, im_h, im_w):
     return im_mask
 
 
-def main(mask_rcnn_model, text_enc_model, text_dec_model, image, device, prob_threshold, tr_threshold, keep_aspect_ratio, limit):
-    trd_input_prev_symbol = 'prev_symbol'
-    trd_input_prev_hidden = 'prev_hidden'
-    trd_input_encoder_outputs = 'encoder_outputs'
-    trd_output_symbols_distr = 'output'
-    trd_output_cur_hidden = 'hidden'
-    alphabet = '  abcdefghijklmnopqrstuvwxyz0123456789'
+# initialize everything we want to maintain across multiple calls
+s3 = boto3.client('s3')
+mask_rcnn_model = '/opt/text-spotting-0005-detector.xml'
+text_enc_model = '/opt/text-spotting-0005-recognizer-encoder.xml'
+text_dec_model = '/opt/text-spotting-0005-recognizer-decoder.xml'
+device = 'CPU'
+prob_threshold = 0.2
+tr_threshold = 0.2
+keep_aspect_ratio = True
+limit = 1000
 
-    # log.info('OpenVINO Runtime')
-    # log.info('\tbuild: {}'.format(get_version()))
-    core = Core()
+trd_input_prev_symbol = 'prev_symbol'
+trd_input_prev_hidden = 'prev_hidden'
+trd_input_encoder_outputs = 'encoder_outputs'
+trd_output_symbols_distr = 'output'
+trd_output_cur_hidden = 'hidden'
+alphabet = '  abcdefghijklmnopqrstuvwxyz0123456789'
 
-    # Read IR
-    log.info('Reading Mask-RCNN model {}'.format(mask_rcnn_model))
-    mask_rcnn_model = core.read_model(mask_rcnn_model)
+core = Core()
 
-    input_tensor_name = 'image'
+# Read IR
+mask_rcnn_model = core.read_model(mask_rcnn_model)
+
+input_tensor_name = 'image'
+
+try:
+    n, c, h, w = mask_rcnn_model.input(input_tensor_name).shape
+    if n != 1:
+        raise RuntimeError('Only batch 1 is supported by the demo application')
+except RuntimeError:
+    raise RuntimeError(
+        'Demo supports only topologies with the following input tensor name: {}'.format(input_tensor_name))
+
+required_output_names = {'boxes', 'labels', 'masks', 'text_features'}
+for output_tensor_name in required_output_names:
+    try:
+        mask_rcnn_model.output(output_tensor_name)
+    except RuntimeError:
+        raise RuntimeError('Demo supports only topologies with the following output tensor names: {}'.format(
+            ', '.join(required_output_names)))
+
+text_enc_model = core.read_model(text_enc_model)
+
+text_dec_model = core.read_model(text_dec_model)
+
+mask_rcnn_compiled_model = core.compile_model(mask_rcnn_model, device_name=device)
+mask_rcnn_infer_request = mask_rcnn_compiled_model.create_infer_request()
+
+text_enc_compiled_model = core.compile_model(text_enc_model, device)
+text_enc_output_tensor = text_enc_compiled_model.outputs[0]
+text_enc_infer_request = text_enc_compiled_model.create_infer_request()
+
+text_dec_compiled_model = core.compile_model(text_dec_model, device)
+text_dec_infer_request = text_dec_compiled_model.create_infer_request()
+
+hidden_shape = text_dec_model.input(trd_input_prev_hidden).shape
+text_dec_output_names = {trd_output_symbols_distr, trd_output_cur_hidden}
+
+
+
+def lambda_handler(event, context):
+    s3Event = event['Records'][0]['s3']
+    bucket = s3Event['bucket']['name']
+    key = s3Event['object']['key']
 
     try:
-        n, c, h, w = mask_rcnn_model.input(input_tensor_name).shape
-        if n != 1:
-            raise RuntimeError('Only batch 1 is supported by the demo application')
-    except RuntimeError:
-        raise RuntimeError('Demo supports only topologies with the following input tensor name: {}'.format(input_tensor_name))
+        file_content = s3.get_object(Bucket=bucket, Key=key)['Body'].read()
+        image = Image.open(io.BytesIO(file_content))
+    except Exception as e:
+        print(f'could not get image from bucket: {e}')
+        return {
+            'statusCode': 400,
+            'body': json.dumps(f'could not get image from bucket: {e}')
+        }
 
-    required_output_names = {'boxes', 'labels', 'masks', 'text_features'}
-    for output_tensor_name in required_output_names:
-        try:
-            mask_rcnn_model.output(output_tensor_name)
-        except RuntimeError:
-            raise RuntimeError('Demo supports only topologies with the following output tensor names: {}'.format(
-                ', '.join(required_output_names)))
-
-    log.info('Reading Text Recognition Encoder model {}'.format(text_enc_model))
-    text_enc_model = core.read_model(text_enc_model)
-
-    log.info('Reading Text Recognition Decoder model {}'.format(text_dec_model))
-    text_dec_model = core.read_model(text_dec_model)
-
-    mask_rcnn_compiled_model = core.compile_model(mask_rcnn_model, device_name=device)
-    mask_rcnn_infer_request = mask_rcnn_compiled_model.create_infer_request()
-    log.info('The Mask-RCNN model {} is loaded to {}'.format(mask_rcnn_model, device))
-
-    text_enc_compiled_model = core.compile_model(text_enc_model, device)
-    text_enc_output_tensor = text_enc_compiled_model.outputs[0]
-    text_enc_infer_request = text_enc_compiled_model.create_infer_request()
-    log.info('The Text Recognition Encoder model {} is loaded to {}'.format(text_enc_model, device))
-
-    text_dec_compiled_model = core.compile_model(text_dec_model, device)
-    text_dec_infer_request = text_dec_compiled_model.create_infer_request()
-    log.info('The Text Recognition Decoder model {} is loaded to {}'.format(text_dec_model, device))
-
-    hidden_shape = text_dec_model.input(trd_input_prev_hidden).shape
-    text_dec_output_names = {trd_output_symbols_distr, trd_output_cur_hidden}
-
-    frame = Image.open(image)
+    frame = image
     if not keep_aspect_ratio:
         # Resize the image to a target size.
         scale_x = w / frame.width
@@ -164,10 +167,10 @@ def main(mask_rcnn_model, text_enc_model, text_dec_model, image, device, prob_th
 
     boxes[:, 0::2] /= scale_x
     boxes[:, 1::2] /= scale_y
-    masks = []
-    for box, cls, raw_mask in zip(boxes, classes, raw_masks):
-        mask = segm_postprocess(box, raw_mask, frame.height, frame.width)
-        masks.append(mask)
+    # masks = []
+    # for box, cls, raw_mask in zip(boxes, classes, raw_masks):
+    #     mask = segm_postprocess(box, raw_mask, frame.height, frame.width)
+    #     masks.append(mask)
 
     texts = []
     for feature in text_features:
@@ -198,18 +201,9 @@ def main(mask_rcnn_model, text_enc_model, text_dec_model, image, device, prob_th
 
         texts.append(text if text_confidence >= tr_threshold else '')
 
-    print(texts)
+    detected_text = texts
 
-
-if __name__ == '__main__':
-    mask_rcnn_model = 'intel/text-spotting-0005/text-spotting-0005-detector/FP16-INT8/text-spotting-0005-detector.xml'
-    text_enc_model = 'intel/text-spotting-0005/text-spotting-0005-recognizer-encoder/FP32/text-spotting-0005-recognizer-encoder.xml'
-    text_dec_model = 'intel/text-spotting-0005/text-spotting-0005-recognizer-decoder/FP32/text-spotting-0005-recognizer-decoder.xml'
-    image = '/home/jtyo/data/moto_3/278293396_136147238971473_2077956108611685243_n.jpg.jpg'
-    device = 'CPU'
-    prob_threshold = 0.2
-    tr_threshold = 0.2
-    keep_aspect_ratio = False
-    limit = 1000
-
-    main(mask_rcnn_model, text_enc_model, text_dec_model, image, device, prob_threshold, tr_threshold, keep_aspect_ratio, limit)
+    return {
+        'statusCode': 200,
+        'body': json.dumps(f'Finished Processing image, found these numbers: {detected_text}')
+    }
